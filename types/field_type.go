@@ -285,7 +285,7 @@ func (ft *FieldType) FormatAsCastType(w io.Writer) {
 		if ft.Flag&mysql.BinaryFlag != 0 {
 			fmt.Fprint(w, " BINARY")
 		}
-		if ft.Charset != charset.CharsetBin && ft.Charset != charset.CharsetUTF8 {
+		if ft.Charset != charset.CharsetBin && (ft.Charset != charset.CharsetUTF8 && ft.Charset != charset.CharsetUTF8MB4) {
 			fmt.Fprintf(w, " %s", ft.Charset)
 		}
 	case mysql.TypeDate:
