@@ -652,9 +652,10 @@ func CutIndexPrefix(key kv.Key) []byte {
 // CutIndexKeyNew cuts encoded index key into colIDs to bytes slices.
 // The returned value b is the remaining bytes of the key which would be empty if it is unique index or handle data
 // if it is non-unique index.
-func CutIndexKeyNew(key kv.Key, length int) (values [][]byte, b []byte, err error) {
-	b = key[prefixLen+idLen:]
-	values = make([][]byte, 0, length)
+func CutIndexKeyNew(key kv.Key, length int) ([][]byte, indexKey, error) {
+	var err error
+	b := CutIndexPrefix(key)
+	values := make([][]byte, 0, length)
 	for i := 0; i < length; i++ {
 		var val []byte
 		val, b, err = codec.CutOne(b)
@@ -663,7 +664,7 @@ func CutIndexKeyNew(key kv.Key, length int) (values [][]byte, b []byte, err erro
 		}
 		values = append(values, val)
 	}
-	return
+	return values, indexKey(b), nil
 }
 
 // CutCommonHandle cuts encoded common handle key into colIDs to bytes slices.
@@ -715,6 +716,13 @@ func reEncodeHandle(handle kv.Handle, unsigned bool) ([][]byte, error) {
 	return [][]byte{intHandleBytes}, err
 }
 
+func (value collationV2) data() indexValueUniqUint64 {
+	if int(value[0]) < 8 {
+		return nil
+	}
+	return indexValueUniqUint64(value[len(value)-int(value[0]):])
+}
+
 func decodeRestoredValues(columns []rowcodec.ColInfo, restoredVal []byte) ([][]byte, error) {
 	colIDs := make(map[int64]int, len(columns))
 	for i, col := range columns {
@@ -729,8 +737,12 @@ func decodeRestoredValues(columns []rowcodec.ColInfo, restoredVal []byte) ([][]b
 	return resultValues, nil
 }
 
-func decodeIndexKvOldCollation(key, value []byte, colsLen int, hdStatus HandleStatus) ([][]byte, error) {
-	resultValues, b, err := CutIndexKeyNew(key, colsLen)
+type collationV1 []byte
+type collationV2 []byte
+type encodingUniqueCommon []byte
+
+func decodeIndexKvCollationV1(key []byte, value collationV1, colsLen int, hdStatus HandleStatus) ([][]byte, error) {
+	resultValues, keySuffix, err := CutIndexKeyNew(key, colsLen)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -738,9 +750,9 @@ func decodeIndexKvOldCollation(key, value []byte, colsLen int, hdStatus HandleSt
 		return resultValues, nil
 	}
 	var handle kv.Handle
-	if len(b) > 0 {
+	if len(keySuffix) > 0 {
 		// non-unique index
-		handle, err = decodeHandleInIndexKey(b)
+		handle, err = keySuffix.decodeHandle()
 		if err != nil {
 			return nil, err
 		}
@@ -751,7 +763,7 @@ func decodeIndexKvOldCollation(key, value []byte, colsLen int, hdStatus HandleSt
 		resultValues = append(resultValues, handleBytes...)
 	} else {
 		// In unique int handle index.
-		handle = decodeIntHandleInIndexValue(value)
+		handle = indexValueUniqUint64(value).decodeHandle()
 		handleBytes, err := reEncodeHandle(handle, hdStatus == HandleIsUnsigned)
 		if err != nil {
 			return nil, errors.Trace(err)
@@ -764,27 +776,55 @@ func decodeIndexKvOldCollation(key, value []byte, colsLen int, hdStatus HandleSt
 // DecodeIndexKV uses to decode index key values.
 func DecodeIndexKV(key, value []byte, colsLen int, hdStatus HandleStatus, columns []rowcodec.ColInfo) ([][]byte, error) {
 	if len(value) <= MaxOldEncodeValueLen {
-		return decodeIndexKvOldCollation(key, value, colsLen, hdStatus)
+		return decodeIndexKvCollationV1(key, collationV1(value), colsLen, hdStatus)
 	}
-	return decodeIndexKvGeneral(key, value, colsLen, hdStatus, columns)
+	return decodeIndexCollationV2(key, collationV2(value), colsLen, hdStatus, columns)
+}
+
+type encodingUniqueCommonData []byte
+
+func (value encodingUniqueCommonData) data() []byte {
+	handleLen := uint16(value[2])<<8 + uint16(value[3])
+	handleEndOff := 4 + handleLen
+	return value[4:handleEndOff]
+}
+
+func (value encodingUniqueCommonData) decodeHandle() (kv.Handle, error) {
+	return kv.NewCommonHandle(value.data())
+}
+
+func (v encodingUniqueCommon) allData() []byte {
+	value := v[:len(v)-int(v[0])]
+	return value
+}
+
+func (v encodingUniqueCommon) data() []byte {
+	value := v.allData()
+	return encodingUniqueCommonData(value).data()
 }
 
 // DecodeIndexHandle uses to decode the handle from index key/value.
 func DecodeIndexHandle(key, value []byte, colsLen int) (kv.Handle, error) {
-	_, b, err := CutIndexKeyNew(key, colsLen)
+	_, keySuffix, err := CutIndexKeyNew(key, colsLen)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	if len(b) > 0 {
-		return decodeHandleInIndexKey(b)
+	if len(keySuffix) > 0 {
+		return keySuffix.decodeHandle()
 	} else if len(value) >= 8 {
-		return decodeHandleInIndexValue(value)
+		iv, err := makeIndexValue(value)
+		if err != nil {
+			return nil, err
+		}
+		return iv.decodeHandle()
 	}
 	// Should never execute to here.
-	return nil, errors.Errorf("no handle in index key: %v, value: %v", key, value)
+	return nil, errors.Annotatef(err, "no handle in index key: %v", key)
 }
 
-func decodeHandleInIndexKey(keySuffix []byte) (kv.Handle, error) {
+type indexKey []byte
+
+func (keySuffix indexKey) decodeHandle() (kv.Handle, error) {
 	remain, d, err := codec.DecodeOne(keySuffix)
 	if err != nil {
 		return nil, errors.Trace(err)
@@ -795,20 +835,29 @@ func decodeHandleInIndexKey(keySuffix []byte) (kv.Handle, error) {
 	return kv.NewCommonHandle(keySuffix)
 }
 
-func decodeHandleInIndexValue(value []byte) (kv.Handle, error) {
+func makeIndexValue(value []byte) (indexValue, error) {
+	if len(value) >= 8 {
+		return indexValue(value), nil
+	}
+	// Should never execute to here.
+	return nil, errors.Errorf("expected value len >=8, got %v", value)
+}
+
+type indexValue []byte
+type indexValueUniqUint64 []byte
+
+func (value indexValue) decodeHandle() (kv.Handle, error) {
 	if len(value) > MaxOldEncodeValueLen {
 		tailLen := value[0]
 		if tailLen >= 8 {
-			return decodeIntHandleInIndexValue(value[len(value)-int(tailLen):]), nil
+			return indexValueUniqUint64(value[len(value)-int(tailLen):]).decodeHandle(), nil
 		}
-		handleLen := uint16(value[2])<<8 + uint16(value[3])
-		return kv.NewCommonHandle(value[4 : 4+handleLen])
+		return encodingUniqueCommonData(value).decodeHandle()
 	}
-	return decodeIntHandleInIndexValue(value), nil
+	return indexValueUniqUint64(value).decodeHandle(), nil
 }
 
-// decodeIntHandleInIndexValue uses to decode index value as int handle id.
-func decodeIntHandleInIndexValue(data []byte) kv.Handle {
+func (data indexValueUniqUint64) decodeHandle() kv.Handle {
 	return kv.IntHandle(binary.BigEndian.Uint64(data))
 }
 
@@ -1109,10 +1158,10 @@ func encodePartitionID(idxVal []byte, partitionID int64) []byte {
 }
 
 type indexValueSegments struct {
-	commonHandle   []byte
+	commonHandle   indexKey
 	partitionID    []byte
 	restoredValues []byte
-	intHandle      []byte
+	intHandle      indexValueUniqUint64
 }
 
 // splitIndexValue splits index value into segments.
@@ -1121,12 +1170,12 @@ func splitIndexValue(value []byte) (segs indexValueSegments) {
 	tail := value[len(value)-tailLen:]
 	value = value[1 : len(value)-tailLen]
 	if len(tail) >= 8 {
-		segs.intHandle = tail[:8]
+		segs.intHandle = indexValueUniqUint64(tail[:8])
 	}
 	if len(value) > 0 && value[0] == CommonHandleFlag {
 		handleLen := uint16(value[1])<<8 + uint16(value[2])
 		handleEndOff := 3 + handleLen
-		segs.commonHandle = value[3:handleEndOff]
+		segs.commonHandle = indexKey(value[3:handleEndOff])
 		value = value[handleEndOff:]
 	}
 	if len(value) > 0 && value[0] == PartitionIDFlag {
@@ -1139,16 +1188,14 @@ func splitIndexValue(value []byte) (segs indexValueSegments) {
 	return
 }
 
-// decodeIndexKvGeneral decodes index key value pair of new layout in an extensible way.
-func decodeIndexKvGeneral(key, value []byte, colsLen int, hdStatus HandleStatus, columns []rowcodec.ColInfo) ([][]byte, error) {
-	var resultValues [][]byte
-	var keySuffix []byte
-	var handle kv.Handle
+// decodeIndexCollationV2 decodes index key value pair of new layout in an extensible way.
+func decodeIndexCollationV2(key []byte, value collationV2, colsLen int, hdStatus HandleStatus, columns []rowcodec.ColInfo) ([][]byte, error) {
 	var err error
+	var handle kv.Handle
 	segs := splitIndexValue(value)
-	resultValues, keySuffix, err = CutIndexKeyNew(key, colsLen)
-	if err != nil {
-		return nil, err
+	resultValues, keySuffix, errCut := CutIndexKeyNew(key, colsLen)
+	if errCut != nil {
+		return nil, errCut
 	}
 	if segs.restoredValues != nil { // new collation
 		resultValues, err = decodeRestoredValues(columns[:colsLen], segs.restoredValues)
@@ -1162,16 +1209,16 @@ func decodeIndexKvGeneral(key, value []byte, colsLen int, hdStatus HandleStatus,
 
 	if segs.intHandle != nil {
 		// In unique int handle index.
-		handle = decodeIntHandleInIndexValue(segs.intHandle)
+		handle = segs.intHandle.decodeHandle()
 	} else if segs.commonHandle != nil {
 		// In unique common handle index.
-		handle, err = decodeHandleInIndexKey(segs.commonHandle)
+		handle, err = segs.commonHandle.decodeHandle()
 		if err != nil {
 			return nil, err
 		}
 	} else {
 		// In non-unique index, decode handle in keySuffix
-		handle, err = decodeHandleInIndexKey(keySuffix)
+		handle, err = keySuffix.decodeHandle()
 		if err != nil {
 			return nil, err
 		}
